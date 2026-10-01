@@ -1,0 +1,5 @@
+print("11 september 2026")
+print("i am feeling very great")
+print(" wanted to learn code it is fun")
+print(" hopefully u started ai company with happy life ")
+print("😉😉")
