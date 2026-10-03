@@ -24,13 +24,8 @@ DEALER_STAND = 17
 
 DECK_X = 120
 DECK_Y = 270
-DEALER_CARD_Y = 160
-YOU_CARD_Y = 365
-DEALER_PANEL_Y = 70
-YOU_PANEL_Y = 462
-PILE_X = 330
-BET_X = 730
-BET_Y = 290
+DEALER_Y = 150
+YOU_Y = 380
 FELT = "#1d7a4a"
 
 SUITS = "♠♥♦♣"
@@ -49,7 +44,7 @@ def mix(c1, c2, t):
 
 
 # ---------- sound ----------
-# Every sound is built from numbers: a sine wave for a ring or a ping,
+# Every sound is built from numbers: a sine wave for a ping or a note,
 # random noise for clicks and rustles. Each one fades out quickly,
 # which is what makes it sound like an object and not a beep.
 
@@ -116,7 +111,26 @@ def make_win():
     return samples
 
 
-def save_wav(path, samples):
+def make_flick():
+    # a short papery snap: a tiny burst of noise and a faint high tick
+    samples = silence(0.08)
+    noise(samples, 0, int(0.014 * RATE), 0.7, 300, 0.1)
+    tone(samples, 0, int(0.05 * RATE), 1800, 0.3, 90)
+    return samples
+
+
+def make_lose():
+    # two falling notes, a low "wah wah"
+    samples = silence(0.7)
+    notes = [330, 247]
+    for i in range(len(notes)):
+        start = int(i * 0.25 * RATE)
+        tone(samples, start, int(0.4 * RATE), notes[i], 0.5, 5)
+        tone(samples, start, int(0.4 * RATE), notes[i] * 1.5, 0.15, 7)
+    return samples
+
+
+def save_wav(path, samples, level):
     # scale to fit, turn the numbers into 16 bit whole numbers and write the file
     peak = 0.001
     for value in samples:
@@ -125,7 +139,7 @@ def save_wav(path, samples):
 
     data = array.array("h")
     for value in samples:
-        data.append(int(value / peak * 0.8 * 32767))
+        data.append(int(value / peak * level * 32767))
 
     with wave.open(path, "wb") as f:
         f.setnchannels(1)
@@ -140,19 +154,24 @@ class Sound:
         self.folder = tempfile.mkdtemp()   # the sounds live here until you quit
         self.names = []
         self.paths = []
+        self.lengths = []    # how long each sound lasts, in seconds
+        self.busy_until = 0  # a quiet sound waits until this time
         self.procs = []      # players that are still running (Mac and Linux)
         self.player = None   # None means no way to play sound was found
 
-        self.make("chips", make_chips())
-        self.make("shuffle", make_shuffle())
-        self.make("win", make_win())
+        self.make("chips", make_chips(), 0.8)
+        self.make("shuffle", make_shuffle(), 0.8)
+        self.make("win", make_win(), 0.8)
+        self.make("flick", make_flick(), 0.35)   # quiet, it plays a lot
+        self.make("lose", make_lose(), 0.7)
         self.find_player()
 
-    def make(self, name, samples):
+    def make(self, name, samples, level):
         path = self.folder + "/" + name + ".wav"
-        save_wav(path, samples)
+        save_wav(path, samples, level)
         self.names.append(name)
         self.paths.append(path)
+        self.lengths.append(len(samples) / RATE)
 
     def find_player(self):
         if sys.platform == "win32":
@@ -165,10 +184,18 @@ class Sound:
                     self.player = command
                     break
 
-    def play(self, name):
+    def play(self, name, soft=False):
+        # a soft sound (the card flick) never interrupts another sound
         if not self.on or self.player is None:
             return
-        path = self.paths[self.names.index(name)]
+        now = time.time()
+        if soft and now < self.busy_until:
+            return
+
+        i = self.names.index(name)
+        path = self.paths[i]
+        if not soft:
+            self.busy_until = now + self.lengths[i]
 
         if self.player == "winsound":
             winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
@@ -203,6 +230,7 @@ class Card:
         self.open = 0.0        # 0 is face down, 1 is face up
         self.want_open = 0.0
         self.glow = False
+        self.landed = False    # True once the flick sound has played
 
     def points(self):
         if self.rank == "A":
@@ -220,62 +248,25 @@ class Card:
         return now >= self.delay and self.x == self.tx and self.y == self.ty
 
 
-class Chip:
-    def __init__(self, x, y, tx, ty, delay, color):
-        self.x = x
-        self.y = y
-        self.tx = tx
-        self.ty = ty
-        self.delay = delay
-        self.color = color
-        self.landed = None   # time it reached its target, None while flying
-
-
 class Hand:
     # one hand of cards with its own bet. After a split you have two of these.
     def __init__(self):
         self.cards = []
         self.bet = 0
-        self.shown = 0       # the total drawn on screen
-        self.label = ""      # result text for a split hand, like "WIN +50"
+        self.label = ""          # result text for a hand, like "WIN +50"
         self.label_color = "white"
 
 
-class Player:
-    def __init__(self, name, chips):
-        self.name = name
-        self.chips = chips
-        self.hands = [Hand()]
-        self.say = ""
-        self.say_until = 0
-
-    def pay(self, amount):
-        amount = min(amount, self.chips)
-        self.chips -= amount
-        return amount
-
-
-# ---------- helpers ----------
-
-def glide(obj, now):
-    if now < obj.delay:
+def glide(card, now):
+    # slide a little closer to the target every frame
+    if now < card.delay:
         return
-    obj.x += (obj.tx - obj.x) * 0.2
-    obj.y += (obj.ty - obj.y) * 0.2
-    if abs(obj.tx - obj.x) < 0.5:
-        obj.x = obj.tx
-    if abs(obj.ty - obj.y) < 0.5:
-        obj.y = obj.ty
-
-
-def hop(chip, now):
-    # pixels above its target a landed chip is drawn, for the bounce
-    if chip.landed is None:
-        return 0
-    t = now - chip.landed
-    if t > 0.4:
-        return 0
-    return -abs(math.sin(t * 14)) * 14 * (1 - t / 0.4)
+    card.x += (card.tx - card.x) * 0.2
+    card.y += (card.ty - card.y) * 0.2
+    if abs(card.tx - card.x) < 0.5:
+        card.x = card.tx
+    if abs(card.ty - card.y) < 0.5:
+        card.y = card.ty
 
 
 def make_deck():
@@ -305,6 +296,13 @@ def is_blackjack(cards):
     return len(cards) == 2 and hand_total(cards) == 21
 
 
+def hand_x(count, k):
+    # one hand sits in the middle, two hands sit left and right
+    if count == 1:
+        return 450
+    return 270 + k * 340
+
+
 # ---------- the game ----------
 
 class Game:
@@ -319,26 +317,22 @@ class Game:
         self.sound = Sound()
         root.protocol("WM_DELETE_WINDOW", self.quit_game)
 
-        self.you = Player("you", 0)
-        self.dealer = Player("dealer", 0)
+        self.hands = [Hand()]    # your hands; two after a split
+        self.dealer = Hand()
+        self.active = 0          # which of your hands is being played
+        self.did_split = False   # a 21 after a split is not a blackjack
+        self.insurance = 0       # chips staked on insurance this hand
         self.deck = []
-        self.chips_flying = []
+        self.chips = 0
         self.start = 1000
         self.bought = 0
         self.min_bet = 20
-        self.phase = "wait"    # idle, insure, you or wait: what the game is waiting for
+        self.phase = "wait"      # idle, insure, you or wait: what the game is waiting for
         self.message = "starting..."
-        self.game_over = False
-        self.active = 0        # which of your hands is being played
-        self.did_split = False # a 21 after a split is not a blackjack
-        self.reveal = False    # True once the dealer's hidden card is turned over
-        self.show_bet = False
-        self.bet_show = 0
         self.banner = ""
         self.banner_color = "white"
-        self.you_gets = 0      # chips that go back to you at the end of the hand
-        self.dealer_change = 0 # how the dealer's stack changes
-        self.insurance = 0     # chips staked on insurance this hand
+        self.reveal = False      # True once the dealer's hidden card is turned over
+        self.game_over = False
 
         self.draw_table()
         self.build_controls()
@@ -355,20 +349,27 @@ class Game:
     def sound_chips(self):
         self.sound.play("chips")
 
+    def sound_win(self):
+        self.sound.play("win")
+
+    def sound_lose(self):
+        self.sound.play("lose")
+
     def build_controls(self):
         bar = tk.Frame(self.root, bg="#120d0a")
         bar.pack(fill="x", pady=8)
-
         font = "Helvetica 12"
+
         self.btn_deal = tk.Button(bar, text="Deal", width=10, font=font, command=self.deal)
         self.btn_deal.pack(side="left", padx=(14, 3))
 
         self.amount = tk.IntVar(value=0)
         self.scale = tk.Scale(bar, from_=0, to=1, orient="horizontal", variable=self.amount,
-                              length=170, showvalue=0, bg="#120d0a", highlightthickness=0)
+                              length=160, showvalue=0, bg="#120d0a", highlightthickness=0,
+                              command=self.on_scale)
         self.scale.pack(side="left", padx=6)
 
-        self.btn_allin = tk.Button(bar, text="All in", width=6, font=font, command=self.do_allin)
+        self.btn_allin = tk.Button(bar, text="All in", width=6, font=font, command=self.all_in)
         self.btn_allin.pack(side="left", padx=3)
         self.btn_add = tk.Button(bar, text="Add chips", width=9, font=font, command=self.add_more)
         self.btn_add.pack(side="left", padx=3)
@@ -382,8 +383,6 @@ class Game:
         self.btn_double.pack(side="left", padx=3)
         self.btn_split = tk.Button(bar, text="Split", width=6, font=font, command=self.do_split)
         self.btn_split.pack(side="left", padx=3)
-
-        self.scale.config(command=self.on_scale)
 
     def on_key(self, event):
         key = event.keysym.lower()
@@ -407,85 +406,61 @@ class Game:
     def on_scale(self, value=None):
         self.btn_deal.config(text="Deal " + str(self.amount.get()))
 
-    def hand_y(self, player):
-        if player is self.you:
-            return YOU_CARD_Y
-        return DEALER_CARD_Y
-
-    def hand_x(self, player, k):
-        # one hand sits in the middle, two hands sit left and right
-        if len(player.hands) == 1:
-            return 450
-        return 270 + k * 340
-
     def all_cards(self):
-        cards = []
-        for player in [self.you, self.dealer]:
-            for hand in player.hands:
-                cards = cards + hand.cards
+        cards = self.dealer.cards[:]
+        for hand in self.hands:
+            cards = cards + hand.cards
         return cards
 
     def total_bet(self):
         total = 0
-        for hand in self.you.hands:
+        for hand in self.hands:
             total += hand.bet
         return total
 
-    # ---------- setting up games and hands ----------
+    # ---------- starting a game and a hand ----------
 
     def new_game(self):
         start = simpledialog.askinteger("Blackjack", "starting chips (100-" + str(MAX_CHIPS) + ")",
                                         parent=self.root, minvalue=100, maxvalue=MAX_CHIPS)
         if start is None:
             start = 1000
-
         self.start = start
         self.bought = start
+        self.chips = start
         self.min_bet = max(1, start // 50)
-        self.you = Player("you", start)
-        self.dealer = Player("dealer", start)
-        self.active = 0
-        self.insurance = 0
         self.game_over = False
+        self.insurance = 0
+        self.hands = [Hand()]
+        self.dealer = Hand()
         self.banner = ""
-        self.show_bet = False
         self.phase = "idle"
         self.message = "choose your bet and press deal"
         self.update_controls()
 
-    def layout(self, player):
+    def layout(self, hands, y):
         # spread the cards of each hand evenly around that hand's center
-        for k in range(len(player.hands)):
-            hand = player.hands[k]
-            n = len(hand.cards)
-            gap = 76
-            if len(player.hands) > 1:
-                gap = 36   # split hands sit closer so both fit on the table
+        count = len(hands)
+        gap = 76
+        if count > 1:
+            gap = 36   # split hands sit closer so both fit on the table
+        for k in range(count):
+            n = len(hands[k].cards)
             for i in range(n):
-                card = hand.cards[i]
-                card.tx = self.hand_x(player, k) - (n - 1) * gap / 2 + i * gap
-                card.ty = self.hand_y(player)
+                card = hands[k].cards[i]
+                card.tx = hand_x(count, k) - (n - 1) * gap / 2 + i * gap
+                card.ty = y
 
-    def add_card(self, player, hand, delay, face_up):
+    def add_card(self, hand, delay, face_up):
+        # the dealer's hand is laid out by itself, yours with all your hands
         card = self.deck.pop()
         card.delay = delay
         card.want_open = face_up
         hand.cards.append(card)
-        self.layout(player)
-
-    def send_bet_chips(self, now, count, lag=0):
-        # lag is how many milliseconds to wait before the clack plays
-        for i in range(count):
-            self.chips_flying.append(Chip(PILE_X, YOU_PANEL_Y + 15 - i * 5,
-                                          BET_X + random.randint(-8, 8),
-                                          BET_Y + random.randint(-5, 5),
-                                          now + i * 0.06,
-                                          CHIP_COLORS[i % len(CHIP_COLORS)]))
-        self.root.after(lag, self.sound_chips)
-        self.root.after(1200, self.land_chips)
-
-    def land_chips(self):
-        self.chips_flying = []
+        if hand is self.dealer:
+            self.layout([self.dealer], DEALER_Y)
+        else:
+            self.layout(self.hands, YOU_Y)
 
     def deal(self, event=None):
         if self.phase != "idle":
@@ -495,107 +470,70 @@ class Game:
             return
 
         bet = self.amount.get()
-        bet = min(bet, self.you.chips)
-        bet = max(bet, min(self.min_bet, self.you.chips))
+        bet = min(bet, self.chips)
+        bet = max(bet, min(self.min_bet, self.chips))
 
         now = time.time()
         self.deck = make_deck()
         self.sound.play("shuffle")
-        self.chips_flying = []
-        self.you.hands = [Hand()]
-        self.dealer.hands = [Hand()]
-        self.you.say = ""
-        self.dealer.say = ""
+        self.root.after(700, self.sound_chips)   # your bet lands after the shuffle
+        self.hands = [Hand()]
+        self.dealer = Hand()
         self.active = 0
         self.did_split = False
         self.insurance = 0
         self.reveal = False
         self.banner = ""
-
-        self.you.hands[0].bet = self.you.pay(bet)
-        self.send_bet_chips(now, 3, 700)   # wait for the shuffle to finish
-        self.show_bet = True
-        self.bet_show = now + 1.0
+        self.hands[0].bet = bet
+        self.chips -= bet
 
         # you, dealer, you, dealer; the dealer's second card stays face down
-        self.add_card(self.you, self.you.hands[0], now + 0.3, 1.0)
-        self.add_card(self.dealer, self.dealer.hands[0], now + 0.55, 1.0)
-        self.add_card(self.you, self.you.hands[0], now + 0.8, 1.0)
-        self.add_card(self.dealer, self.dealer.hands[0], now + 1.05, 0.0)
+        self.add_card(self.hands[0], now + 0.3, 1.0)
+        self.add_card(self.dealer, now + 0.55, 1.0)
+        self.add_card(self.hands[0], now + 0.8, 1.0)
+        self.add_card(self.dealer, now + 1.05, 0.0)
 
         self.phase = "wait"
         self.message = "dealing..."
         self.update_controls()
-        self.root.after(2000, self.check_naturals)
-
-    def add_chips(self, amount):
-        # the dealer always gets the same amount, so the stacks stay even
-        self.you.chips += amount
-        self.dealer.chips += amount
-        self.bought += amount
+        self.root.after(1900, self.check_naturals)
 
     def add_more(self):
         if self.phase != "idle" or self.game_over:
             return
-        room = MAX_CHIPS - self.you.chips
+        room = MAX_CHIPS - self.chips
         if room < 1:
             return
         amount = simpledialog.askinteger("Add chips", "how many? (1-" + str(room) + ")",
                                          parent=self.root, minvalue=1, maxvalue=room)
         if amount is not None:
-            self.add_chips(amount)
-            self.message = "added " + str(amount) + " for you and the dealer"
+            self.chips += amount
+            self.bought += amount
             self.update_controls()
 
-    def do_allin(self):
+    def all_in(self):
         if self.phase != "idle" or self.game_over:
             return
-        self.amount.set(self.you.chips)
+        self.amount.set(self.chips)
         self.deal()
-
-    # ---------- the hand ----------
-
-    def say(self, player, text):
-        player.say = text
-        player.say_until = time.time() + 2.4
-
-    def turn_message(self):
-        if len(self.you.hands) > 1:
-            return "hand " + str(self.active + 1) + " of " + str(len(self.you.hands))
-        return "your turn"
-
-    def refresh_totals(self):
-        for hand in self.you.hands:
-            hand.shown = hand_total(hand.cards)
-
-        dealer_hand = self.dealer.hands[0]
-        if len(dealer_hand.cards) == 0:
-            dealer_hand.shown = 0
-        elif self.reveal:
-            dealer_hand.shown = hand_total(dealer_hand.cards)
-        else:
-            dealer_hand.shown = hand_total([dealer_hand.cards[0]])
-
-    def reveal_dealer(self):
-        self.reveal = True
-        self.dealer.hands[0].cards[1].want_open = 1.0
-        self.root.after(400, self.refresh_totals)
 
     # ---------- insurance and naturals ----------
 
+    def turn_message(self):
+        if len(self.hands) > 1:
+            return "hand " + str(self.active + 1) + " of " + str(len(self.hands))
+        return "your turn"
+
     def insurance_cost(self):
-        return self.you.hands[0].bet // 2
+        return self.hands[0].bet // 2
 
     def can_insure(self):
         cost = self.insurance_cost()
-        return cost >= 1 and self.you.chips >= cost
+        return cost >= 1 and self.chips >= cost
 
     def check_naturals(self):
-        self.refresh_totals()
-        up_card = self.dealer.hands[0].cards[0]
-
         # an ace showing means the dealer might have blackjack, so offer insurance
-        if up_card.rank == "A" and self.can_insure():
+        if self.dealer.cards[0].rank == "A" and self.can_insure():
             self.phase = "insure"
             self.message = "dealer shows an ace: insurance?"
             self.update_controls()
@@ -606,44 +544,40 @@ class Game:
         if self.phase != "insure":
             return
         self.phase = "wait"
-        self.insurance = self.you.pay(self.insurance_cost())
-        self.send_bet_chips(time.time(), 2)
-        self.say(self.you, "insurance")
+        self.insurance = self.insurance_cost()
+        self.chips -= self.insurance
+        self.sound.play("chips")
+        self.message = "insurance taken"
         self.update_controls()
-        self.root.after(1300, self.peek)
+        self.root.after(900, self.peek)
 
     def do_decline(self):
         if self.phase != "insure":
             return
         self.phase = "wait"
-        self.say(self.you, "no thanks")
         self.update_controls()
-        self.root.after(700, self.peek)
+        self.root.after(400, self.peek)
 
     def peek(self):
-        # the dealer checks the hidden card for blackjack
-        you_bj = is_blackjack(self.you.hands[0].cards)
-        dealer_bj = is_blackjack(self.dealer.hands[0].cards)
-
-        if self.insurance > 0 and not dealer_bj:
-            self.say(self.dealer, "no blackjack")
-
-        if you_bj or dealer_bj:
-            if you_bj:
-                self.say(self.you, "blackjack!")
-            if dealer_bj:
-                self.say(self.dealer, "blackjack!")
+        # the dealer checks the hidden card; a blackjack on either side ends the hand
+        if is_blackjack(self.hands[0].cards) or is_blackjack(self.dealer.cards):
             self.phase = "wait"
-            self.reveal_dealer()
+            self.flip_dealer()
             self.update_controls()
-            self.root.after(1300, self.settle)
+            self.root.after(1200, self.settle)
             return
 
         self.phase = "you"
         self.message = self.turn_message()
+        if self.insurance > 0:
+            self.message = "no dealer blackjack, insurance lost"
         self.update_controls()
 
-    # ---------- your moves ----------
+    def flip_dealer(self):
+        self.reveal = True
+        self.dealer.cards[1].want_open = 1.0
+
+    # ---------- playing the hand ----------
 
     def do_hit(self):
         if self.phase == "insure":
@@ -652,10 +586,19 @@ class Game:
         if self.phase != "you":
             return
         self.phase = "wait"
-        self.say(self.you, "hit")
-        self.add_card(self.you, self.you.hands[self.active], time.time(), 1.0)
+        self.add_card(self.hands[self.active], time.time(), 1.0)
         self.update_controls()
-        self.root.after(900, self.after_player_card)
+        self.root.after(900, self.after_card)
+
+    def after_card(self):
+        # called after a card lands on the hand you are playing
+        total = hand_total(self.hands[self.active].cards)
+        if total >= 21:
+            self.root.after(500, self.finish_hand)
+        else:
+            self.phase = "you"
+            self.message = self.turn_message()
+            self.update_controls()
 
     def do_stand(self):
         if self.phase == "insure":
@@ -664,294 +607,224 @@ class Game:
         if self.phase != "you":
             return
         self.phase = "wait"
-        self.say(self.you, "stand")
         self.update_controls()
-        self.root.after(600, self.finish_hand)
+        self.finish_hand()
 
     def do_double(self):
+        # double the bet, take exactly one card, then stand
         if self.phase != "you":
             return
-        hand = self.you.hands[self.active]
-        if len(hand.cards) != 2 or self.you.chips < hand.bet:
+        hand = self.hands[self.active]
+        if len(hand.cards) != 2 or self.chips < hand.bet:
             return
         self.phase = "wait"
-        hand.bet += self.you.pay(hand.bet)
-        self.send_bet_chips(time.time(), 3)
-        self.say(self.you, "double")
-        self.add_card(self.you, hand, time.time() + 0.3, 1.0)
+        self.chips -= hand.bet
+        self.sound.play("chips")
+        hand.bet = hand.bet * 2
+        self.add_card(hand, time.time(), 1.0)
         self.update_controls()
-        self.root.after(1300, self.after_double)
+        self.root.after(1300, self.finish_hand)
 
     def can_split(self):
-        if len(self.you.hands) != 1:
+        if len(self.hands) != 1:
             return False   # only one split per round
-        hand = self.you.hands[0]
+        hand = self.hands[0]
         if len(hand.cards) != 2:
             return False
         if hand.cards[0].rank != hand.cards[1].rank:
             return False
-        return self.you.chips >= hand.bet
+        return self.chips >= hand.bet
 
     def do_split(self):
         if self.phase != "you" or not self.can_split():
             return
         self.phase = "wait"
-        first = self.you.hands[0]
+        first = self.hands[0]
 
         # the second card moves to a new hand with its own bet
         second = Hand()
         second.cards.append(first.cards.pop())
-        second.bet = self.you.pay(first.bet)
-        self.you.hands.append(second)
+        second.bet = first.bet
+        self.chips -= first.bet
+        self.sound.play("chips")
+        self.hands.append(second)
         self.did_split = True
 
-        self.send_bet_chips(time.time(), 3)
-        self.say(self.you, "split")
-        self.layout(self.you)
-        self.add_card(self.you, first, time.time() + 0.3, 1.0)
+        self.layout(self.hands, YOU_Y)
+        self.add_card(first, time.time() + 0.3, 1.0)
         self.message = self.turn_message()
         self.update_controls()
-        self.root.after(1300, self.after_player_card)
-
-    def after_player_card(self):
-        # called after a card lands on the hand you are playing
-        self.refresh_totals()
-        total = hand_total(self.you.hands[self.active].cards)
-        if total > 21:
-            self.say(self.you, "bust")
-            self.root.after(900, self.finish_hand)
-        elif total == 21:
-            self.root.after(600, self.finish_hand)
-        else:
-            self.phase = "you"
-            self.message = self.turn_message()
-            self.update_controls()
-
-    def after_double(self):
-        self.refresh_totals()
-        if hand_total(self.you.hands[self.active].cards) > 21:
-            self.say(self.you, "bust")
-        self.root.after(700, self.finish_hand)
+        self.root.after(1300, self.after_card)
 
     def finish_hand(self):
         # the hand you were playing is done: go to your next hand, or the dealer
-        if self.active + 1 < len(self.you.hands):
+        if self.active + 1 < len(self.hands):
             self.active += 1
-            hand = self.you.hands[self.active]
+            hand = self.hands[self.active]
             self.message = self.turn_message()
             if len(hand.cards) == 1:   # the split hand still needs its second card
-                self.add_card(self.you, hand, time.time(), 1.0)
+                self.add_card(hand, time.time(), 1.0)
             self.update_controls()
-            self.root.after(900, self.after_player_card)
+            self.root.after(900, self.after_card)
             return
 
-        # if every hand busted, the dealer doesn't need to play
+        # if every hand busted, the dealer doesn't need to draw
         alive = False
-        for hand in self.you.hands:
+        for hand in self.hands:
             if hand_total(hand.cards) <= 21:
                 alive = True
 
         if alive:
             self.dealer_turn()
         else:
-            self.reveal_dealer()
-            self.root.after(1200, self.settle)
+            self.flip_dealer()
+            self.root.after(1000, self.settle)
 
     def dealer_turn(self):
         self.phase = "wait"
         self.message = "dealer's turn"
         self.update_controls()
-        self.reveal_dealer()
+        self.flip_dealer()
         self.root.after(1000, self.dealer_step)
 
     def dealer_step(self):
-        dealer_hand = self.dealer.hands[0]
-        total = hand_total(dealer_hand.cards)
-        if total < DEALER_STAND:
-            self.say(self.dealer, "hit")
-            self.add_card(self.dealer, dealer_hand, time.time(), 1.0)
-            self.root.after(900, self.refresh_totals)
-            self.root.after(1300, self.dealer_step)
+        # the dealer draws until reaching 17, one card at a time
+        if hand_total(self.dealer.cards) < DEALER_STAND:
+            self.add_card(self.dealer, time.time(), 1.0)
+            self.root.after(1100, self.dealer_step)
         else:
-            self.refresh_totals()
-            if total > 21:
-                self.say(self.dealer, "bust")
-            else:
-                self.say(self.dealer, "stand")
-            self.root.after(1100, self.settle)
+            self.root.after(500, self.settle)
 
     # ---------- ending a hand ----------
 
     def settle(self):
-        self.phase = "wait"
-        dealer_cards = self.dealer.hands[0].cards
-        theirs = hand_total(dealer_cards)
-        dealer_bj = is_blackjack(dealer_cards)
+        theirs = hand_total(self.dealer.cards)
+        dealer_bj = is_blackjack(self.dealer.cards)
 
-        avail = self.dealer.chips   # the dealer can only pay what it has
-        self.you_gets = 0
-        self.dealer_change = 0
+        total_bet = self.insurance   # insurance counts as money you put in
+        total_back = 0               # chips that come back to you, bets included
         message = ""
 
-        # insurance is settled first, and counts as money you put in
-        total_bet = self.insurance
         ins_text = ""
         if self.insurance > 0:
             if dealer_bj:
-                pay = min(self.insurance * 2, avail)   # the dealer can only pay what it has
-                avail -= pay
-                self.you_gets += self.insurance + pay
-                self.dealer_change -= pay
-                ins_text = "insurance +" + str(pay)
+                total_back += self.insurance * 3   # the stake plus 2 to 1
+                ins_text = "insurance +" + str(self.insurance * 2)
             else:
-                self.dealer_change += self.insurance
-                avail += self.insurance
                 ins_text = "insurance -" + str(self.insurance)
 
-        for k in range(len(self.you.hands)):
-            hand = self.you.hands[k]
+        for k in range(len(self.hands)):
+            hand = self.hands[k]
             bet = hand.bet
             mine = hand_total(hand.cards)
             # a 21 on two cards after a split is just 21
             you_bj = (not self.did_split) and is_blackjack(hand.cards)
 
+            # win is how much you gain; the bet comes back on a win or a push
             win = 0
             result = "lose"
-            if you_bj and not dealer_bj:
-                win = int(bet * 1.5)
-                result = "win"
-                text = "blackjack! you win "
-            elif mine > 21:
-                text = "bust, you lose "
-            elif dealer_bj and not you_bj:
-                text = "dealer blackjack, you lose "
-            elif you_bj and dealer_bj:
+            if you_bj and dealer_bj:
                 result = "push"
                 text = "both blackjack, push"
+            elif you_bj:
+                win = int(bet * 1.5)
+                result = "win"
+                text = "blackjack! you win " + str(win)
+            elif mine > 21:
+                text = "bust, you lose " + str(bet)
+            elif dealer_bj:
+                text = "dealer blackjack, you lose " + str(bet)
             elif theirs > 21:
                 win = bet
                 result = "win"
-                text = "dealer busts, you win "
+                text = "dealer busts, you win " + str(win)
             elif mine > theirs:
                 win = bet
                 result = "win"
-                text = "you win "
+                text = "you win " + str(win)
             elif mine < theirs:
-                text = "dealer wins, you lose "
+                text = "dealer wins, you lose " + str(bet)
             else:
                 result = "push"
                 text = "push, bet returned"
 
-            win = min(win, avail)
-
             if result == "win":
-                avail -= win
-                self.you_gets += bet + win
-                self.dealer_change -= win
+                total_back += bet + win
                 hand.label = "WIN +" + str(win)
                 hand.label_color = "#ffd966"
-                text += str(win)
                 for card in hand.cards:
                     card.glow = True
             elif result == "push":
-                self.you_gets += bet
+                total_back += bet
                 hand.label = "PUSH"
                 hand.label_color = "white"
             else:
-                self.dealer_change += bet
-                avail += bet
                 hand.label = "LOSE -" + str(bet)
                 hand.label_color = "#ff8a80"
-                text += str(bet)
 
-            if len(self.you.hands) == 1:
+            if len(self.hands) == 1:
                 message = text
             else:
                 message += "hand " + str(k + 1) + ": " + hand.label + "     "
             total_bet += bet
 
-        net = self.you_gets - total_bet
+        if ins_text != "":
+            message += "   " + ins_text
+
+        # sounds: chips come back to you, then a jingle if you won or a wah if you lost
+        if total_back > 0:
+            self.sound.play("chips")
+        if total_back > total_bet:
+            self.root.after(500, self.sound_win)
+        elif total_back < total_bet:
+            self.root.after(500, self.sound_lose)
+
+        self.chips += total_back
+        net = total_back - total_bet
         if net > 0:
             self.banner = "WIN +" + str(net)
             self.banner_color = "#ffd966"
-            self.sound.play("win")
         elif net < 0:
             self.banner = "LOSE -" + str(0 - net)
             self.banner_color = "#ff8a80"
         else:
             self.banner = "PUSH"
-            if len(self.you.hands) > 1 or self.insurance > 0:
+            if len(self.hands) > 1 or self.insurance > 0:
                 self.banner = "EVEN"
             self.banner_color = "white"
 
-        if ins_text != "":
-            message += "   " + ins_text
         self.message = message
-        self.update_controls()
-        self.root.after(1300, self.start_payout)
-
-    def start_payout(self):
-        now = time.time()
-        self.show_bet = False
-        self.chips_flying = []
-
-        # the bet pile goes to whoever gets it
-        ty = DEALER_PANEL_Y + 15
-        if self.you_gets > 0:
-            ty = YOU_PANEL_Y + 15
-        for i in range(6):
-            self.chips_flying.append(Chip(BET_X + random.randint(-8, 8),
-                                          BET_Y + random.randint(-5, 5),
-                                          PILE_X, ty, now + i * 0.08,
-                                          CHIP_COLORS[i % len(CHIP_COLORS)]))
-
-        # a win is paid by the dealer, so chips also fly from its stack to yours
-        if self.you_gets > self.total_bet() + self.insurance:
-            for i in range(4):
-                self.chips_flying.append(Chip(PILE_X, DEALER_PANEL_Y + 15 - i * 5,
-                                              PILE_X + 14, YOU_PANEL_Y + 15,
-                                              now + 0.3 + i * 0.08,
-                                              CHIP_COLORS[i % len(CHIP_COLORS)]))
-        self.root.after(450, self.sound_chips)
-        self.root.after(1500, self.finish_payout)
-
-    def finish_payout(self):
-        self.you.chips += self.you_gets
-        self.dealer.chips += self.dealer_change
-        for hand in self.you.hands:
+        for hand in self.hands:
             hand.bet = 0
         self.insurance = 0
-        self.chips_flying = []
+        self.phase = "wait"
+        self.update_controls()
+        self.root.after(1800, self.finish)
+
+    def finish(self):
         self.phase = "idle"
         self.message = "choose your bet and press deal"
-
-        if self.dealer.chips < self.min_bet:
-            self.dealer.chips += self.start
-            self.message = "dealer rebought " + str(self.start)
-
-        self.check_game()
+        if self.chips < self.min_bet:
+            self.out_of_chips()
         self.update_controls()
 
-    def check_game(self):
-        if self.you.chips >= self.min_bet:
-            return
-
+    def out_of_chips(self):
         self.message = "you're out of chips"
         if messagebox.askyesno("Out of chips", "rebuy?", parent=self.root):
-            room = MAX_CHIPS - self.you.chips
-            amount = simpledialog.askinteger("Rebuy",
-                                             "chips to add (" + str(self.min_bet) + "-" + str(room) + ")",
-                                             parent=self.root, minvalue=self.min_bet, maxvalue=room)
+            room = MAX_CHIPS - self.chips
+            amount = simpledialog.askinteger(
+                "Rebuy", "chips to add (" + str(self.min_bet) + "-" + str(room) + ")",
+                parent=self.root, minvalue=self.min_bet, maxvalue=room)
             if amount is not None:
-                self.add_chips(amount)
+                self.chips += amount
+                self.bought += amount
                 self.message = "rebought " + str(amount)
                 return
         self.game_over = True
         self.message = "game over"
 
-    # ---------- buttons on and off ----------
-
     def update_controls(self):
+        # buttons are only on when the game is waiting for them
         off = "disabled"
         self.btn_hit.config(state=off, text="Hit")
         self.btn_stand.config(state=off, text="Stand")
@@ -967,10 +840,10 @@ class Game:
             self.btn_stand.config(state="normal", text="No thanks")
 
         if self.phase == "you":
-            hand = self.you.hands[self.active]
+            hand = self.hands[self.active]
             self.btn_hit.config(state="normal")
             self.btn_stand.config(state="normal")
-            if len(hand.cards) == 2 and self.you.chips >= hand.bet:
+            if len(hand.cards) == 2 and self.chips >= hand.bet:
                 self.btn_double.config(state="normal")
             if self.can_split():
                 self.btn_split.config(state="normal")
@@ -980,11 +853,10 @@ class Game:
             if self.game_over:
                 self.btn_deal.config(text="New game")
             else:
-                high = self.you.chips
+                high = self.chips
                 low = min(self.min_bet, high)
                 self.scale.config(from_=low, to=high, state="normal")
-                value = self.amount.get()
-                value = max(low, min(value, high))   # keep your last bet if it still fits
+                value = max(low, min(self.amount.get(), high))   # keep your last bet if it fits
                 self.amount.set(value)
                 self.btn_allin.config(state="normal")
                 self.btn_add.config(state="normal")
@@ -1062,17 +934,13 @@ class Game:
         for i in range(count):
             self.draw_chip(x, y - i * 5, CHIP_COLORS[i % len(CHIP_COLORS)])
 
-    def draw_panel(self, player, y):
-        c = self.canvas
-        c.create_text(450, y - 14, text=player.name.upper(), fill="white",
-                      font="Helvetica 15 bold", tags="fg")
-        c.create_text(450, y + 10, text=str(player.chips) + " chips", fill="#ffd966",
-                      font="Helvetica 13", tags="fg")
-        self.pile(PILE_X, y + 15, player.chips, max(1, self.start // 4))
-
-    def draw_total(self, total, x, y):
-        if total <= 0:
+    def draw_total(self, cards, x, y, show_all):
+        if len(cards) == 0:
             return
+        if show_all:
+            total = hand_total(cards)
+        else:
+            total = hand_total([cards[0]])   # the dealer shows only the open card
         color = "#d9f2e3"
         text = str(total)
         if total > 21:
@@ -1081,40 +949,23 @@ class Game:
         self.canvas.create_text(x, y, text=text, fill=color,
                                 font="Helvetica 15 bold", tags="fg")
 
-    def draw_bubble(self, player, y, now):
-        left = player.say_until - now
-        if player.say == "" or left <= 0:
-            return
-
-        # solid for most of its life, then every color blends into the felt
-        t = max(0, 1 - left / 0.6)
-        fill = mix("#ffffff", FELT, t)
-        edge = mix("#333333", FELT, t)
-        ink = mix("#222222", FELT, t)
-
-        w = 26 + 8 * len(player.say)
-        self.rounded(780 - w / 2, y - 15, 780 + w / 2, y + 15, 10, fill, edge)
-        self.canvas.create_text(780, y, text=player.say, fill=ink,
-                                font="Helvetica 12 bold", tags="fg")
-
     def draw_hand_marks(self):
-        # totals above each of your hands, and the split extras
         c = self.canvas
-        self.draw_total(self.dealer.hands[0].shown, 450, DEALER_CARD_Y + 62)
+        self.draw_total(self.dealer.cards, 450, DEALER_Y + 62, self.reveal)
 
-        count = len(self.you.hands)
+        count = len(self.hands)
         for k in range(count):
-            hand = self.you.hands[k]
-            x = self.hand_x(self.you, k)
-            self.draw_total(hand.shown, x, YOU_CARD_Y - 62)
+            hand = self.hands[k]
+            x = hand_x(count, k)
+            self.draw_total(hand.cards, x, YOU_Y - 62, True)
 
             if count > 1:
                 # a gold bar shows which hand you are playing right now
                 if self.phase == "you" and k == self.active:
-                    c.create_line(x - 70, YOU_CARD_Y + 56, x + 70, YOU_CARD_Y + 56,
+                    c.create_line(x - 70, YOU_Y + 56, x + 70, YOU_Y + 56,
                                   fill="#f1c40f", width=4, tags="fg")
                 if hand.label != "":
-                    c.create_text(x, YOU_CARD_Y + 68, text=hand.label, fill=hand.label_color,
+                    c.create_text(x, YOU_Y + 70, text=hand.label, fill=hand.label_color,
                                   font="Helvetica 13 bold", tags="fg")
 
     def draw(self, now):
@@ -1124,24 +975,25 @@ class Game:
         for i in range(3):
             self.draw_back(DECK_X - i * 2, DECK_Y - i * 2, CARD_W)
 
-        self.draw_panel(self.dealer, DEALER_PANEL_Y)
-        self.draw_panel(self.you, YOU_PANEL_Y)
+        # names and chip stacks
+        c.create_text(450, 70, text="DEALER", fill="white", font="Helvetica 15 bold", tags="fg")
+        c.create_text(450, 468, text="YOU   " + str(self.chips) + " chips", fill="#ffd966",
+                      font="Helvetica 14 bold", tags="fg")
+        self.pile(300, 480, self.chips, max(1, self.start // 4))
 
+        # your bet sits on the right
         total_bet = self.total_bet()
-        if self.show_bet and total_bet > 0 and now >= self.bet_show:
-            self.pile(BET_X, BET_Y, total_bet, max(1, self.start // 20))
-            c.create_text(BET_X, BET_Y + 24, text="bet " + str(total_bet), fill="white",
+        if total_bet > 0:
+            self.pile(760, 290, total_bet, max(1, self.start // 20))
+            c.create_text(760, 314, text="bet " + str(total_bet), fill="white",
                           font="Helvetica 13 bold", tags="fg")
 
-        if self.show_bet and self.insurance > 0 and now >= self.bet_show:
-            c.create_text(BET_X, BET_Y + 42, text="insurance " + str(self.insurance),
-                          fill="#ffd966", font="Helvetica 12 bold", tags="fg")
+        if self.insurance > 0:
+            c.create_text(760, 334, text="insurance " + str(self.insurance), fill="#ffd966",
+                          font="Helvetica 12 bold", tags="fg")
 
         for card in self.all_cards():
             self.draw_card(card)
-
-        for chip in self.chips_flying:
-            self.draw_chip(chip.x, chip.y + hop(chip, now), chip.color)
 
         self.draw_hand_marks()
 
@@ -1151,13 +1003,10 @@ class Game:
             c.create_text(450, 260, text=self.banner, fill=self.banner_color,
                           font="Helvetica 26 bold", tags="fg")
 
-        self.draw_bubble(self.dealer, DEALER_CARD_Y, now)
-        self.draw_bubble(self.you, YOU_CARD_Y, now)
-
         c.create_text(450, 20, text=self.message, fill="#f5f5f5",
                       font="Helvetica 15 bold", tags="fg")
 
-        net = self.you.chips + total_bet + self.insurance - self.bought
+        net = self.chips + total_bet + self.insurance - self.bought
         net_text = str(net)
         if net >= 0:
             net_text = "+" + str(net)
@@ -1176,16 +1025,14 @@ class Game:
         for card in self.all_cards():
             glide(card, now)
             if card.arrived(now):
+                # the first time a card reaches its spot, it makes a flick
+                if not card.landed:
+                    card.landed = True
+                    self.sound.play("flick", True)
                 if card.open < card.want_open:
                     card.open = min(card.want_open, card.open + 0.08)
                 elif card.open > card.want_open:
                     card.open = max(card.want_open, card.open - 0.08)
-
-        for chip in self.chips_flying:
-            glide(chip, now)
-            if chip.landed is None and now >= chip.delay:
-                if chip.x == chip.tx and chip.y == chip.ty:
-                    chip.landed = now
 
         self.draw(now)
         self.root.after(FRAME_MS, self.frame)
